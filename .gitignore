@@ -1,0 +1,10 @@
+cookies.txt
+config.json
+profile/
+shots/
+chromium-snapshot/
+venv/
+__pycache__/
+*.csv
+storage_state.json
+proxy.log

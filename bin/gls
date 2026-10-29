@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Google Maps Location Sharing reader.
+
+Reimplements the reverse-engineered RPC contract documented in
+docs/contract.md in this repo
+(originally extracted from locationsharinglib 4.2.0 with REA plus live
+probes on 2026-10-28).
+
+Read-only. Prints locations to stdout only and persists nothing about
+the people it reads. Cookie values are never printed or logged.
+"""
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+from datetime import datetime, timezone
+from http.cookiejar import MozillaCookieJar
+
+import requests
+
+CONNECTOR_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_COOKIES = os.path.join(CONNECTOR_DIR, "cookies.txt")
+CONFIG_PATH = os.path.join(CONNECTOR_DIR, "config.json")
+
+READ_URL = "https://www.google.com/maps/rpc/locationsharing/read"
+ACCOUNT_URL = "https://myaccount.google.com/?hl=en"
+PB = ("!1m7!8m6!1m3!1i14!2i8413!3i5385!2i6!3x4095"
+      "!2m3!1e0!2sm!3i407105169!3m7!2sen!5e1105!12m4"
+      "!1e68!2m2!1sset!2sRoadmap!4e1!5m4!1e4!8m2!1e0!"
+      "1e1!6m9!1e12!2i2!26m1!4b1!30m1!"
+      "1f1.3953487873077393!39b1!44e1!50e0!23i4111425")
+
+EXIT_NO_COOKIES = 2
+EXIT_INVALID_SESSION = 3
+EXIT_PARSE = 4
+EXIT_NOT_FOUND = 5
+
+
+def fail(code, message, **extra):
+    out = {"ok": False, "error": message}
+    out.update(extra)
+    print(json.dumps(out, indent=2))
+    sys.exit(code)
+
+
+def load_config():
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as fh:
+                cfg = json.load(fh)
+        except (ValueError, OSError):
+            cfg = {}
+    if os.environ.get("GLS_ACCOUNT"):
+        cfg["account"] = os.environ["GLS_ACCOUNT"]
+    if os.environ.get("GLS_AUTHUSER"):
+        try:
+            cfg["authuser"] = int(os.environ["GLS_AUTHUSER"])
+        except ValueError:
+            pass
+    cfg.setdefault("authuser", 0)
+    return cfg
+
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def cookies_path():
+    return os.environ.get("GLS_COOKIES_FILE") or DEFAULT_COOKIES
+
+
+def load_jar(path):
+    jar = MozillaCookieJar(path)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception as exc:  # unreadable or not Netscape format
+        fail(EXIT_NO_COOKIES, f"could not parse cookies file: {exc.__class__.__name__}")
+    return jar
+
+
+def build_session(path):
+    jar = load_jar(path)
+    session = requests.Session()
+    session.cookies.update(jar)
+    session.headers.update({
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"),
+    })
+    return session, jar
+
+
+def session_valid(session, authuser=0):
+    """Live-validated rule (corrected 2026-10-29): the session is live
+    iff the read RPC itself returns an authenticated-shaped payload —
+    HTTP 200, anti-XSSI prefix, and element [0] a list (of shared
+    people, possibly empty). The unauthenticated shape has [0] = null.
+
+    The locationsharinglib rule (myaccount with no redirect history)
+    does NOT hold here: a verified-live session still 302s through
+    accounts.google.com/ServiceLogin and /accounts/SetOSID before
+    landing back on myaccount with 200, so redirect history alone
+    cannot distinguish live from dead sessions."""
+    try:
+        resp = session.get(READ_URL,
+                           params={"authuser": authuser, "hl": "en",
+                                   "gl": "us", "pb": PB},
+                           timeout=30)
+    except requests.RequestException:
+        return False
+    if not resp.ok or not resp.text.startswith(")]}'"):
+        return False
+    text = resp.text
+    text = text.split("\n", 1)[1] if "\n" in text else text[4:]
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return False
+    return (isinstance(data, list) and len(data) > 0
+            and isinstance(data[0], list))
+
+
+def safe(seq, *indices):
+    cur = seq
+    for idx in indices:
+        try:
+            cur = cur[idx]
+        except (IndexError, TypeError, KeyError):
+            return None
+    return cur
+
+
+def parse_person(entry, fallback_identity=None):
+    """Index map from the REA contract dossier (Person._populate)."""
+    identity = safe(entry, 6) or fallback_identity
+    loc = safe(entry, 1)
+    if loc is None or safe(loc, 1) is None:
+        return None
+    lat = safe(loc, 1, 2)
+    lng = safe(loc, 1, 1)
+    if lat is None or lng is None:
+        return None
+    ts_ms = safe(loc, 2)
+    person = {
+        "id": safe(identity, 0) if identity else None,
+        "full_name": safe(identity, 2) if identity else None,
+        "nickname": safe(identity, 3) if identity else None,
+        "picture_url": safe(identity, 1) if identity else None,
+        "latitude": lat,
+        "longitude": lng,
+        "timestamp_ms": ts_ms,
+        "accuracy_m": safe(loc, 3),
+        "address": safe(loc, 4),
+        "country_code": safe(loc, 6),
+        "charging": None,
+        "battery_level": None,
+    }
+    batt = safe(entry, 13)
+    if batt is not None:
+        charging = safe(batt, 0)
+        person["charging"] = bool(charging) if charging is not None else None
+        person["battery_level"] = safe(batt, 1)
+    if ts_ms:
+        try:
+            dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
+            person["datetime_utc"] = dt.isoformat()
+            person["age_seconds"] = max(0, int(time.time() - dt.timestamp()))
+        except (ValueError, OSError, OverflowError):
+            pass
+    return person
+
+
+def parse_payload(data, account_email=None):
+    people = []
+    shared = safe(data, 0) or []
+    for entry in shared:
+        person = parse_person(entry)
+        if person:
+            person["source"] = "shared"
+            people.append(person)
+    self_loc = safe(data, 9, 1)
+    if self_loc is not None:
+        synthetic = [account_email, self_loc]
+        person = parse_person(
+            synthetic,
+            fallback_identity=[None, None, account_email, account_email],
+        )
+        if person:
+            person["source"] = "authenticated_account"
+            people.append(person)
+    return people
+
+
+def fetch_people(authuser, account_email, fixture=None):
+    if fixture:
+        with open(fixture) as fh:
+            text = fh.read()
+    else:
+        path = cookies_path()
+        if not os.path.exists(path):
+            fail(EXIT_NO_COOKIES,
+                 "no cookies file imported yet",
+                 hint="Export google.com cookies as cookies.txt, then run: gls auth import <file> --account <email>")
+        session, _jar = build_session(path)
+        if not session_valid(session, authuser):
+            fail(EXIT_INVALID_SESSION,
+                 "cookies do not carry a live Google session",
+                 hint="Re-export cookies from a signed-in browser and run gls auth import again. Signing out of Google anywhere invalidates exported cookies.")
+        params = {"authuser": authuser, "hl": "en", "gl": "us", "pb": PB}
+        try:
+            resp = session.get(READ_URL, params=params, timeout=30)
+        except requests.RequestException as exc:
+            fail(EXIT_PARSE, f"read request failed: {exc.__class__.__name__}")
+        if not resp.ok:
+            fail(EXIT_PARSE, f"read endpoint returned HTTP {resp.status_code}")
+        text = resp.text
+    # Strip the anti-XSSI prefix: )]}' then JSON.
+    if text.startswith(")]}'"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[4:]
+    try:
+        data = json.loads(text)
+    except ValueError:
+        fail(EXIT_PARSE, "could not parse location sharing response as JSON")
+    return parse_payload(data, account_email)
+
+
+# ---------------------------------------------------------------- auth
+
+def cmd_auth_status(_args):
+    cfg = load_config()
+    path = cookies_path()
+    if not os.path.exists(path):
+        print(json.dumps({
+            "ok": False,
+            "cookies_file_present": False,
+            "account": cfg.get("account"),
+            "authuser": cfg.get("authuser", 0),
+            "hint": "Export google.com cookies as cookies.txt, then run: gls auth import <file> --account <email>",
+        }, indent=2))
+        sys.exit(EXIT_NO_COOKIES)
+    session, jar = build_session(path)
+    cookies = list(jar)
+    google_cookies = [c for c in cookies if "google." in c.domain]
+    expiries = [c.expires for c in google_cookies if c.expires]
+    valid = session_valid(session, cfg.get("authuser", 0))
+    print(json.dumps({
+        "ok": valid,
+        "cookies_file_present": True,
+        "cookie_count": len(cookies),
+        "google_cookie_count": len(google_cookies),
+        "google_cookie_names": sorted({c.name for c in google_cookies}),
+        "earliest_google_cookie_expiry_utc": (
+            datetime.fromtimestamp(min(expiries), tz=timezone.utc).isoformat() if expiries else None),
+        "session_valid": valid,
+        "account": cfg.get("account"),
+        "authuser": cfg.get("authuser", 0),
+    }, indent=2))
+    sys.exit(0 if valid else EXIT_INVALID_SESSION)
+
+
+def cmd_auth_import(args):
+    src = os.path.expanduser(args.file)
+    if not os.path.exists(src):
+        fail(EXIT_NO_COOKIES, f"file not found: {src}")
+    jar = load_jar(src)
+    google_cookies = [c for c in jar if "google." in c.domain]
+    if not google_cookies:
+        fail(EXIT_NO_COOKIES, "that file carries no google.com cookies, so it cannot be a Google session export")
+    dest = cookies_path()
+    shutil.copyfile(src, dest)
+    os.chmod(dest, 0o600)
+    cfg = load_config()
+    if args.account:
+        cfg["account"] = args.account
+    if args.authuser is not None:
+        cfg["authuser"] = args.authuser
+    save_config(cfg)
+    print(json.dumps({
+        "ok": True,
+        "imported_google_cookie_count": len(google_cookies),
+        "stored_at": dest,
+        "account": cfg.get("account"),
+        "authuser": cfg.get("authuser", 0),
+        "next": "Run: gls auth status",
+    }, indent=2))
+
+
+# -------------------------------------------------------------- people
+
+def cmd_people(args):
+    cfg = load_config()
+    authuser = args.authuser if args.authuser is not None else cfg.get("authuser", 0)
+    people = fetch_people(authuser, cfg.get("account"), fixture=args.fixture)
+    print(json.dumps({"ok": True, "count": len(people), "people": people}, indent=2))
+
+
+def find_person(people, name):
+    wanted = name.strip().lower()
+    for person in people:
+        for key in ("full_name", "nickname"):
+            value = person.get(key)
+            if value and value.lower() == wanted:
+                return person
+    return None
+
+
+def cmd_person(args):
+    cfg = load_config()
+    authuser = args.authuser if args.authuser is not None else cfg.get("authuser", 0)
+    people = fetch_people(authuser, cfg.get("account"), fixture=args.fixture)
+    person = find_person(people, args.name)
+    if not person:
+        fail(EXIT_NOT_FOUND, f"nobody named {args.name!r} is sharing with this account",
+             known=[p.get("full_name") for p in people])
+    print(json.dumps({"ok": True, "person": person}, indent=2))
+
+
+def cmd_locate(args):
+    cfg = load_config()
+    authuser = args.authuser if args.authuser is not None else cfg.get("authuser", 0)
+    people = fetch_people(authuser, cfg.get("account"), fixture=args.fixture)
+    person = find_person(people, args.name)
+    if not person:
+        fail(EXIT_NOT_FOUND, f"nobody named {args.name!r} is sharing with this account",
+             known=[p.get("full_name") for p in people])
+    print(json.dumps({"ok": True, "locate": {
+        "full_name": person.get("full_name"),
+        "latitude": person.get("latitude"),
+        "longitude": person.get("longitude"),
+        "address": person.get("address"),
+        "accuracy_m": person.get("accuracy_m"),
+        "datetime_utc": person.get("datetime_utc"),
+        "age_seconds": person.get("age_seconds"),
+    }}, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="gls", description="Google Maps Location Sharing reader (read-only)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    auth = sub.add_parser("auth", help="cookie session management")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    auth_sub.add_parser("status", help="validate the imported cookie session without printing values")
+    imp = auth_sub.add_parser("import", help="import a Netscape cookies.txt export for google.com")
+    imp.add_argument("file")
+    imp.add_argument("--account", help="email of the Google account that receives the shares")
+    imp.add_argument("--authuser", type=int, default=None, help="signed-in account slot, default 0")
+
+    for name, fn in (("people", cmd_people),):
+        p = sub.add_parser(name, help="list everyone sharing with this account, plus the account itself")
+        p.add_argument("--authuser", type=int, default=None)
+        p.add_argument("--fixture", help=argparse.SUPPRESS)
+        p.set_defaults(fn=fn)
+    for name, fn in (("person", cmd_person), ("locate", cmd_locate)):
+        p = sub.add_parser(name, help=f"{'full record for' if name == 'person' else 'coordinates for'} one person by full name or nickname")
+        p.add_argument("name")
+        p.add_argument("--authuser", type=int, default=None)
+        p.add_argument("--fixture", help=argparse.SUPPRESS)
+        p.set_defaults(fn=fn)
+
+    args = parser.parse_args()
+    if args.command == "auth":
+        if args.auth_command == "status":
+            cmd_auth_status(args)
+        elif args.auth_command == "import":
+            cmd_auth_import(args)
+    else:
+        args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
