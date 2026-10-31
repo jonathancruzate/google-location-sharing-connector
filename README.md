@@ -68,3 +68,10 @@ read.
 ## License
 
 MIT
+
+## Install it with Muse
+
+Just give this prompt to your Muse:
+
+> "Install Google Location Sharing Connector from https://github.com/jonathancruzate/google-location-sharing-connector — read the README, install it, set it up for me, and show me how to use it."
+
